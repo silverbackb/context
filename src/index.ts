@@ -49,11 +49,15 @@ app.get("/version", (c) => c.json({ package: "@silverbackbase/context", version:
 // §7/§8) : un item non tagué remonte toujours. Un item périmé n'est jamais
 // masqué, il est renvoyé avec un marqueur `stale` explicite (conception.md
 // §7 : "renvoyé avec un marqueur explicite", jamais silencieusement filtré).
+// Filtre optionnel `project_id`, sémantique stricte (voir commentaire de
+// listItemsForWorkspace dans db.ts) : isole les apprentissages d'un client
+// des autres clients du même workspace.
 // Aucun item pour ce workspace → `{ items: [] }`, jamais une erreur.
 app.get("/items", requireAuth, async (c) => {
   const workspaceId = getWid(c);
   const taskType = c.req.query("task_type") || undefined;
-  const rows = await listItemsForWorkspace(workspaceId, taskType);
+  const projectId = c.req.query("project_id") || undefined;
+  const rows = await listItemsForWorkspace(workspaceId, taskType, projectId);
   const now = Date.now();
   const items = rows.map((row) => ({
     ...row,
