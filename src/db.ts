@@ -46,6 +46,33 @@ export async function migrate() {
   // listItemsForWorkspace ci-dessous pour la sémantique du filtre.
   await sql`ALTER TABLE items ADD COLUMN IF NOT EXISTS project_id TEXT`;
 
+  // Lot 2 (VIS-249) : table `proposals`, la seule porte d'entrée pour une
+  // affirmation nouvelle ou une contradiction (conception.md §6). Aucun tool
+  // MCP n'insère jamais directement dans `items` : voir context_propose et
+  // context_confirm côté silverbackbase-mcp. `contradicts_item_id` NULL =
+  // proposition d'affirmation nouvelle, renseigné = proposition de
+  // contradiction sur un item existant. `status` reste à 'pending' dans ce
+  // lot : le pipeline qui le fait passer à 'accepted'/'rejected' est le Lot 3
+  // (VIS-250), pas implémenté ici.
+  await sql`
+    CREATE TABLE IF NOT EXISTS proposals (
+      id                  SERIAL PRIMARY KEY,
+      workspace_id        TEXT NOT NULL DEFAULT 'local',
+      project_id          TEXT,
+      contradicts_item_id INTEGER,
+      affirmation         TEXT NOT NULL,
+      primitives_read     JSONB NOT NULL,
+      window_start        TIMESTAMPTZ,
+      window_end          TIMESTAMPTZ,
+      metrics             JSONB NOT NULL,
+      task_types          TEXT[],
+      status              TEXT NOT NULL DEFAULT 'pending',
+      created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      resolved_at         TIMESTAMPTZ,
+      resolved_by         TEXT
+    )
+  `;
+
   console.log(JSON.stringify({ service: "context", event: "migrated", timestamp: new Date().toISOString() }));
 }
 
@@ -68,12 +95,29 @@ export interface ItemRow {
   created_at:        string;
 }
 
+export interface ProposalRow {
+  id:                  number;
+  workspace_id:        string;
+  project_id:          string | null;
+  contradicts_item_id: number | null;
+  affirmation:         string;
+  primitives_read:     unknown;
+  window_start:        string | null;
+  window_end:          string | null;
+  metrics:             unknown;
+  task_types:          string[] | null;
+  status:              "pending" | "accepted" | "rejected";
+  created_at:          string;
+  resolved_at:         string | null;
+  resolved_by:         string | null;
+}
+
 // ── Item queries ──────────────────────────────────────────────────────────────
 //
-// Lecture seule pour ce lot (Lot 1, VIS-248). Le régime d'écriture
-// (context_propose, file de validation Improve) est le Lot 2 (VIS-249) : les
-// items de test de ce lot sont insérés manuellement en SQL par Cyril, pas par
-// un tool MCP.
+// listItemsForWorkspace reste en lecture seule (Lot 1, VIS-248). Le régime
+// d'écriture des items ne change pas au Lot 2 (VIS-249) : la seule fonction
+// qui touche `items` ci-dessous est confirmItem, en UPDATE d'un compteur
+// existant. Aucune fonction de ce fichier ne fait d'INSERT INTO items.
 
 // Défaut inclusif (conception.md §7/§8) : un item dont task_types est NULL ou
 // vide remonte toujours, quel que soit le task_type demandé. Un item taggé ne
@@ -112,4 +156,95 @@ export async function listItemsForWorkspace(workspaceId: string, taskType?: stri
     ORDER BY created_at DESC
   `;
   return rows as unknown as ItemRow[];
+}
+
+// ── Proposal queries (Lot 2, VIS-249) ──────────────────────────────────────────
+//
+// Seule porte d'entrée pour une affirmation nouvelle ou une contradiction
+// (conception.md §6). Ce lot crée des propositions, il ne les résout jamais :
+// aucune fonction ici ne fait passer une ligne `status` de 'pending' à
+// 'accepted'/'rejected', ni ne recopie une proposition vers `items`. Ce
+// pipeline de validation est le Lot 3 (VIS-250), un ticket séparé.
+
+// Vérifie qu'un item existe bien pour ce workspace_id ET ce project_id, avant
+// d'accepter une proposition de contradiction. Un contradicts_item_id qui ne
+// correspond à aucune ligne (mauvais id, mauvais workspace, mauvais projet)
+// doit faire échouer l'écriture côté route plutôt que produire une proposition
+// orpheline.
+export async function itemExistsForWorkspace(workspaceId: string, itemId: number, projectId?: string): Promise<boolean> {
+  const projectIdFilter = projectId
+    ? sql`AND project_id = ${projectId}`
+    : sql``;
+  const rows = await sql`
+    SELECT id FROM items
+    WHERE id = ${itemId}
+      AND workspace_id = ${workspaceId}
+      ${projectIdFilter}
+    LIMIT 1
+  `;
+  return rows.length > 0;
+}
+
+export interface CreateProposalInput {
+  workspaceId:        string;
+  projectId?:          string;
+  affirmation:        string;
+  primitivesRead:     unknown;
+  windowStart?:       string;
+  windowEnd?:         string;
+  metrics:            unknown;
+  taskTypes?:         string[];
+  contradictsItemId?: number;
+}
+
+// INSERT unique de ce fichier, et volontairement limité à `proposals`. C'est
+// la propriété centrale du Lot 2 : une affirmation nouvelle ou une
+// contradiction s'écrit ici, jamais dans `items`.
+export async function createProposal(input: CreateProposalInput): Promise<ProposalRow> {
+  const rows = await sql`
+    INSERT INTO proposals (
+      workspace_id, project_id, contradicts_item_id, affirmation,
+      primitives_read, window_start, window_end, metrics, task_types
+    ) VALUES (
+      ${input.workspaceId},
+      ${input.projectId ?? null},
+      ${input.contradictsItemId ?? null},
+      ${input.affirmation},
+      ${sql.json(input.primitivesRead as postgres.JSONValue)},
+      ${input.windowStart ?? null},
+      ${input.windowEnd ?? null},
+      ${sql.json(input.metrics as postgres.JSONValue)},
+      ${input.taskTypes ?? null}
+    )
+    RETURNING *
+  `;
+  return rows[0] as unknown as ProposalRow;
+}
+
+// ── Confirm (Lot 2, VIS-249) ────────────────────────────────────────────────────
+//
+// Seule fonction qui écrit dans `items` pour ce lot, et seulement en UPDATE
+// d'un compteur sur une ligne déjà existante. Aucune colonne de contenu
+// (affirmation, metrics, primitives_read...) n'est modifiée : confirmItem ne
+// peut jamais faire naître une affirmation nouvelle, seulement renforcer la
+// confiance d'une affirmation déjà validée. Requête atomique en une seule
+// instruction (pas de lecture puis écriture séparée) pour éviter toute course
+// entre deux confirmations concurrentes. Retourne null si aucune ligne ne
+// correspond (item inexistant, ou n'appartenant pas à ce workspace/projet),
+// pour que la route sache rejeter avec un 404 explicite plutôt que masquer
+// l'échec.
+export async function confirmItem(workspaceId: string, itemId: number, projectId?: string): Promise<ItemRow | null> {
+  const projectIdFilter = projectId
+    ? sql`AND project_id = ${projectId}`
+    : sql``;
+  const rows = await sql`
+    UPDATE items
+    SET observation_count = observation_count + 1,
+        last_confirmed_at = NOW()
+    WHERE id = ${itemId}
+      AND workspace_id = ${workspaceId}
+      ${projectIdFilter}
+    RETURNING *
+  `;
+  return (rows[0] as unknown as ItemRow) ?? null;
 }

@@ -2,7 +2,7 @@ import { serve } from "@hono/node-server";
 import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { readFileSync } from "node:fs";
-import { migrate, listItemsForWorkspace } from "./db.js";
+import { migrate, listItemsForWorkspace, createProposal, itemExistsForWorkspace, confirmItem } from "./db.js";
 import { requireAuth } from "./auth.js";
 
 let SERVICE_VERSION = "0.0.0";
@@ -64,6 +64,97 @@ app.get("/items", requireAuth, async (c) => {
     stale: row.revalidate_at ? new Date(row.revalidate_at).getTime() < now : false,
   }));
   return c.json({ items });
+});
+
+// POST /proposals : seule route qui accepte une affirmation nouvelle ou une
+// contradiction (Lot 2, VIS-249, conception.md §6). Écrit exclusivement dans
+// `proposals`, jamais dans `items` : aucune affirmation ne devient une vérité
+// tant qu'un humain ou le pipeline Improve (Lot 3, VIS-250, pas fait ici) ne
+// l'a pas validée.
+//
+// Provenance recalculable minimale (conception.md §7) : `affirmation` non
+// vide, `primitives_read` tableau non vide, `metrics` objet non vide. Une
+// proposition qui ne porte pas ce minimum est refusée à l'écriture (400),
+// avant même d'atteindre la file de validation.
+app.post("/proposals", requireAuth, async (c) => {
+  const workspaceId = getWid(c);
+  const body = await c.req.json().catch(() => null);
+  if (!body || typeof body !== "object") {
+    return c.json({ error: "Body JSON invalide" }, 400);
+  }
+
+  const { project_id, affirmation, primitives_read, window_start, window_end, metrics, task_types, contradicts_item_id } = body as Record<string, unknown>;
+
+  if (typeof affirmation !== "string" || affirmation.trim().length === 0) {
+    return c.json({ error: "affirmation : chaîne non vide requise" }, 400);
+  }
+  if (!Array.isArray(primitives_read) || primitives_read.length === 0) {
+    return c.json({ error: "primitives_read : tableau non vide requis (provenance recalculable, conception.md §7)" }, 400);
+  }
+  if (typeof metrics !== "object" || metrics === null || Array.isArray(metrics) || Object.keys(metrics).length === 0) {
+    return c.json({ error: "metrics : objet non vide requis (provenance recalculable, conception.md §7)" }, 400);
+  }
+  if (project_id !== undefined && typeof project_id !== "string") {
+    return c.json({ error: "project_id : chaîne attendue" }, 400);
+  }
+  if (contradicts_item_id !== undefined && typeof contradicts_item_id !== "number") {
+    return c.json({ error: "contradicts_item_id : nombre attendu" }, 400);
+  }
+
+  if (contradicts_item_id !== undefined) {
+    const exists = await itemExistsForWorkspace(workspaceId, contradicts_item_id, project_id as string | undefined);
+    if (!exists) {
+      return c.json({ error: `contradicts_item_id ${contradicts_item_id} : aucun item trouvé pour ce workspace/projet` }, 400);
+    }
+  }
+
+  const proposal = await createProposal({
+    workspaceId,
+    projectId: project_id as string | undefined,
+    affirmation,
+    primitivesRead: primitives_read,
+    windowStart: window_start as string | undefined,
+    windowEnd: window_end as string | undefined,
+    metrics,
+    taskTypes: task_types as string[] | undefined,
+    contradictsItemId: contradicts_item_id as number | undefined,
+  });
+
+  return c.json({
+    proposal_id: proposal.id,
+    status: "pending",
+    gesture: contradicts_item_id !== undefined ? "contradict" : "new",
+  });
+});
+
+// POST /items/:id/confirm : seul chemin d'écriture directe dans `items`
+// (Lot 2, VIS-249, conception.md §6). N'ajoute aucune affirmation nouvelle :
+// incrémente `observation_count` et rafraîchit `last_confirmed_at` sur une
+// ligne déjà existante. 404 explicite si l'item n'existe pas, ou n'appartient
+// pas à ce workspace/projet, plutôt qu'un échec silencieux.
+app.post("/items/:id/confirm", requireAuth, async (c) => {
+  const workspaceId = getWid(c);
+  const itemId = parseInt(c.req.param("id"), 10);
+  if (Number.isNaN(itemId)) {
+    return c.json({ error: "id : identifiant d'item invalide" }, 400);
+  }
+
+  const body = await c.req.json().catch(() => ({}));
+  const projectId = typeof (body as Record<string, unknown>)?.project_id === "string"
+    ? (body as Record<string, unknown>).project_id as string
+    : undefined;
+
+  const updated = await confirmItem(workspaceId, itemId, projectId);
+  if (!updated) {
+    return c.json({ error: `Item ${itemId} introuvable pour ce workspace/projet` }, 404);
+  }
+
+  return c.json({
+    confirmed: true,
+    item_id: updated.id,
+    observation_count: updated.observation_count,
+    last_confirmed_at: updated.last_confirmed_at,
+  });
 });
 
 // ── Boot ──────────────────────────────────────────────────────────────────────
