@@ -1,0 +1,28 @@
+{
+  "name": "@silverbackbase/context",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Context : couche de fusion cloud (HTTP) pour SilverBackBase. Pas une primitive, ne se publie pas sur npm.",
+  "license": "BSL-1.1",
+  "type": "module",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsx src/index.ts",
+    "start": "node dist/index.js",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@hono/node-server": "^1.12.0",
+    "hono": "^4.3.0",
+    "postgres": "^3.4.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsx": "^4.0.0",
+    "typescript": "^5.5.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
