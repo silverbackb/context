@@ -2,7 +2,23 @@ import { serve } from "@hono/node-server";
 import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { readFileSync } from "node:fs";
-import { migrate, listItemsForWorkspace, createProposal, itemExistsForWorkspace, confirmItem } from "./db.js";
+import {
+  migrate,
+  listItemsForWorkspace,
+  createProposal,
+  itemExistsForWorkspace,
+  confirmItem,
+  logActivity,
+  getProposal,
+  listProposals,
+  updateProposal,
+  acceptProposal,
+  rejectProposal,
+  getItemHistory,
+  revertItem,
+  listActivityLog,
+  ContextError,
+} from "./db.js";
 import { requireAuth } from "./auth.js";
 
 let SERVICE_VERSION = "0.0.0";
@@ -120,10 +136,19 @@ app.post("/proposals", requireAuth, async (c) => {
     contradictsItemId: contradicts_item_id as number | undefined,
   });
 
+  const gesture = contradicts_item_id !== undefined ? "contradict" : "new";
+  await logActivity(
+    workspaceId,
+    proposal.project_id,
+    "proposal_created",
+    `Proposition ${proposal.id} creee (${gesture})`,
+    proposal.id
+  );
+
   return c.json({
     proposal_id: proposal.id,
     status: "pending",
-    gesture: contradicts_item_id !== undefined ? "contradict" : "new",
+    gesture,
   });
 });
 
@@ -149,12 +174,241 @@ app.post("/items/:id/confirm", requireAuth, async (c) => {
     return c.json({ error: `Item ${itemId} introuvable pour ce workspace/projet` }, 404);
   }
 
+  await logActivity(
+    workspaceId,
+    updated.project_id,
+    "item_confirmed",
+    `Item ${itemId} confirme (observation ${updated.observation_count})`,
+    itemId
+  );
+
   return c.json({
     confirmed: true,
     item_id: updated.id,
     observation_count: updated.observation_count,
     last_confirmed_at: updated.last_confirmed_at,
   });
+});
+
+// GET /proposals : liste filtrable de la file de propositions (Lot 3,
+// VIS-250). Query params `project_id?`, `status?` (pending/accepted/rejected).
+// Aucune de ces routes n'est appelable via un tool MCP (conception.md §6) :
+// elles ne sont branchees que sur les routes HTTP de ce service, jamais sur
+// silverbackbase-mcp.
+app.get("/proposals", requireAuth, async (c) => {
+  const workspaceId = getWid(c);
+  const projectId = c.req.query("project_id") || undefined;
+  const status = c.req.query("status") || undefined;
+  const proposals = await listProposals(workspaceId, projectId, status);
+  return c.json({ proposals });
+});
+
+// PATCH /proposals/:id : edite les champs d'une proposition encore 'pending'
+// (ex. l'humain corrige l'affirmation avant d'accepter). 409 si la
+// proposition est deja resolue.
+app.patch("/proposals/:id", requireAuth, async (c) => {
+  const workspaceId = getWid(c);
+  const proposalId = parseInt(c.req.param("id"), 10);
+  if (Number.isNaN(proposalId)) {
+    return c.json({ error: "id : identifiant de proposition invalide" }, 400);
+  }
+
+  const body = await c.req.json().catch(() => null);
+  if (!body || typeof body !== "object") {
+    return c.json({ error: "Body JSON invalide" }, 400);
+  }
+  const patchBody = body as Record<string, unknown>;
+  const { affirmation, primitives_read, metrics } = patchBody;
+
+  if (affirmation !== undefined && (typeof affirmation !== "string" || affirmation.trim().length === 0)) {
+    return c.json({ error: "affirmation : chaine non vide requise si fournie" }, 400);
+  }
+  if (primitives_read !== undefined && (!Array.isArray(primitives_read) || primitives_read.length === 0)) {
+    return c.json({ error: "primitives_read : tableau non vide requis si fourni (conception.md §7)" }, 400);
+  }
+  if (metrics !== undefined && (typeof metrics !== "object" || metrics === null || Array.isArray(metrics) || Object.keys(metrics).length === 0)) {
+    return c.json({ error: "metrics : objet non vide requis si fourni (conception.md §7)" }, 400);
+  }
+
+  const existing = await getProposal(proposalId, workspaceId);
+  if (!existing) {
+    return c.json({ error: `Proposition ${proposalId} introuvable pour ce workspace` }, 404);
+  }
+  if (existing.status !== "pending") {
+    return c.json({ error: `Proposition ${proposalId} deja resolue (statut : ${existing.status})` }, 409);
+  }
+
+  const updated = await updateProposal(proposalId, workspaceId, {
+    affirmation:    affirmation as string | undefined,
+    primitivesRead: primitives_read,
+    windowStart:    "window_start" in patchBody ? (patchBody.window_start as string | null) : undefined,
+    windowEnd:      "window_end" in patchBody ? (patchBody.window_end as string | null) : undefined,
+    metrics,
+    taskTypes:      "task_types" in patchBody ? (patchBody.task_types as string[] | null) : undefined,
+  });
+
+  if (!updated) {
+    // Course perdue entre le check ci-dessus et l'UPDATE (proposition resolue entre-temps).
+    return c.json({ error: `Proposition ${proposalId} deja resolue` }, 409);
+  }
+
+  return c.json({ proposal: updated });
+});
+
+// POST /proposals/:id/accept : passe une proposition 'pending' a 'accepted'
+// et ecrit dans `items` (creation ou mise a jour selon contradicts_item_id,
+// conception.md §6). `overrides` permet a l'humain de corriger l'affirmation
+// avant de l'accepter, sans passer par un PATCH separe.
+app.post("/proposals/:id/accept", requireAuth, async (c) => {
+  const workspaceId = getWid(c);
+  const proposalId = parseInt(c.req.param("id"), 10);
+  if (Number.isNaN(proposalId)) {
+    return c.json({ error: "id : identifiant de proposition invalide" }, 400);
+  }
+
+  const body = await c.req.json().catch(() => ({}));
+  const bodyObj = (body ?? {}) as Record<string, unknown>;
+  const projectId = typeof bodyObj.project_id === "string" ? bodyObj.project_id : undefined;
+  const rawOverrides = bodyObj.overrides && typeof bodyObj.overrides === "object"
+    ? bodyObj.overrides as Record<string, unknown>
+    : undefined;
+
+  const existing = await getProposal(proposalId, workspaceId);
+  if (!existing) {
+    return c.json({ error: `Proposition ${proposalId} introuvable pour ce workspace` }, 404);
+  }
+  if (projectId !== undefined && existing.project_id !== projectId) {
+    return c.json({ error: `Proposition ${proposalId} n'appartient pas au projet ${projectId}` }, 404);
+  }
+  if (existing.status !== "pending") {
+    return c.json({ error: `Proposition ${proposalId} deja resolue (statut : ${existing.status})` }, 409);
+  }
+
+  const overrides = rawOverrides
+    ? {
+        affirmation:    typeof rawOverrides.affirmation === "string" ? rawOverrides.affirmation : undefined,
+        primitivesRead: rawOverrides.primitives_read,
+        windowStart:    "window_start" in rawOverrides ? (rawOverrides.window_start as string | null) : undefined,
+        windowEnd:      "window_end" in rawOverrides ? (rawOverrides.window_end as string | null) : undefined,
+        metrics:        rawOverrides.metrics,
+        taskTypes:      "task_types" in rawOverrides ? (rawOverrides.task_types as string[] | null) : undefined,
+      }
+    : undefined;
+
+  try {
+    const item = await acceptProposal(proposalId, workspaceId, overrides);
+    if (!item) {
+      // Course perdue entre le check ci-dessus et l'acceptation (proposition resolue entre-temps).
+      return c.json({ error: `Proposition ${proposalId} deja resolue` }, 409);
+    }
+    return c.json({ accepted: true, item });
+  } catch (err) {
+    if (err instanceof ContextError) {
+      const status = err.status === 404 ? 404 : 400;
+      return c.json({ error: err.message }, status);
+    }
+    throw err;
+  }
+});
+
+// POST /proposals/:id/reject : passe une proposition 'pending' a 'rejected'.
+// N'ecrit jamais dans `items`.
+app.post("/proposals/:id/reject", requireAuth, async (c) => {
+  const workspaceId = getWid(c);
+  const proposalId = parseInt(c.req.param("id"), 10);
+  if (Number.isNaN(proposalId)) {
+    return c.json({ error: "id : identifiant de proposition invalide" }, 400);
+  }
+
+  const body = await c.req.json().catch(() => ({}));
+  const bodyObj = (body ?? {}) as Record<string, unknown>;
+  const projectId = typeof bodyObj.project_id === "string" ? bodyObj.project_id : undefined;
+  const reason = typeof bodyObj.reason === "string" ? bodyObj.reason : undefined;
+
+  const existing = await getProposal(proposalId, workspaceId);
+  if (!existing) {
+    return c.json({ error: `Proposition ${proposalId} introuvable pour ce workspace` }, 404);
+  }
+  if (projectId !== undefined && existing.project_id !== projectId) {
+    return c.json({ error: `Proposition ${proposalId} n'appartient pas au projet ${projectId}` }, 404);
+  }
+  if (existing.status !== "pending") {
+    return c.json({ error: `Proposition ${proposalId} deja resolue (statut : ${existing.status})` }, 409);
+  }
+
+  const rejected = await rejectProposal(proposalId, workspaceId, reason);
+  if (!rejected) {
+    return c.json({ error: `Proposition ${proposalId} deja resolue` }, 409);
+  }
+
+  return c.json({ rejected: true, proposal_id: proposalId });
+});
+
+// GET /items/:id/history : historique append-only d'un item, plus recent en
+// premier (Lot 3, VIS-250). L'isolation project_id est verifiee via
+// itemExistsForWorkspace avant lecture, plutot que de faire porter le filtre
+// a getItemHistory : items_history n'a pas a etre interroge deux fois pour
+// la meme garantie.
+app.get("/items/:id/history", requireAuth, async (c) => {
+  const workspaceId = getWid(c);
+  const itemId = parseInt(c.req.param("id"), 10);
+  if (Number.isNaN(itemId)) {
+    return c.json({ error: "id : identifiant d'item invalide" }, 400);
+  }
+  const projectId = c.req.query("project_id") || undefined;
+
+  const exists = await itemExistsForWorkspace(workspaceId, itemId, projectId);
+  if (!exists) {
+    return c.json({ error: `Item ${itemId} introuvable pour ce workspace/projet` }, 404);
+  }
+
+  const history = await getItemHistory(itemId, workspaceId);
+  return c.json({ history });
+});
+
+// POST /items/:id/revert : restaure un item a un etat anterieur (conception.md
+// §9, "Activity... mutations du contexte avec possibilite de retour arriere").
+// Sans `to_history_id`, annule le dernier changement. Avec, restaure l'etat
+// produit par cet evenement precis. 400 explicite si aucun historique, ou si
+// la cible de restauration est vide (ex. tenter de restaurer le `before` d'un
+// evenement 'created').
+app.post("/items/:id/revert", requireAuth, async (c) => {
+  const workspaceId = getWid(c);
+  const itemId = parseInt(c.req.param("id"), 10);
+  if (Number.isNaN(itemId)) {
+    return c.json({ error: "id : identifiant d'item invalide" }, 400);
+  }
+
+  const body = await c.req.json().catch(() => ({}));
+  const bodyObj = (body ?? {}) as Record<string, unknown>;
+  const projectId = typeof bodyObj.project_id === "string" ? bodyObj.project_id : undefined;
+  const toHistoryId = typeof bodyObj.to_history_id === "number" ? bodyObj.to_history_id : undefined;
+
+  try {
+    const item = await revertItem(itemId, workspaceId, projectId, toHistoryId);
+    return c.json({ reverted: true, item });
+  } catch (err) {
+    if (err instanceof ContextError) {
+      const status = err.status === 404 ? 404 : 400;
+      return c.json({ error: err.message }, status);
+    }
+    throw err;
+  }
+});
+
+// GET /logs : journal d'activite unifie, plus recent en premier (conception.md
+// §9). Query params `project_id?`, `limit?` (defaut 50). Ne construit aucun
+// seuil de significativite ni regroupement anti-friction : une liste simple
+// triee par date suffit pour ce lot (voir rapport de tache, c'est un choix
+// assume, pas un oubli).
+app.get("/logs", requireAuth, async (c) => {
+  const workspaceId = getWid(c);
+  const projectId = c.req.query("project_id") || undefined;
+  const limitParam = c.req.query("limit");
+  const parsedLimit = limitParam ? parseInt(limitParam, 10) : 50;
+  const limit = Number.isNaN(parsedLimit) ? 50 : parsedLimit;
+  const logs = await listActivityLog(workspaceId, projectId, limit);
+  return c.json({ logs });
 });
 
 // ── Boot ──────────────────────────────────────────────────────────────────────
