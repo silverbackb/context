@@ -1,5 +1,41 @@
 # Changelog
 
+## 2026-07-24
+
+### Corrigé
+
+Trois mécaniques promises par la conception (§6/§7) existaient dans le schéma mais n'étaient pas
+câblées dans le code, et restaient donc inertes.
+
+- **Péremption réactivée.** `revalidate_at` n'était écrit nulle part : le marqueur `stale` de
+  `GET /items` valait donc toujours `false`, un item périmé n'était jamais signalé. Il est
+  désormais posé (fenêtre de 30 jours par défaut, `REVALIDATE_WINDOW`) à la création d'un item
+  (acceptation d'une affirmation nouvelle), à l'acceptation d'une contradiction, et repoussé à
+  chaque confirmation.
+- **Promotion de confiance.** `confirmItem` incrémentait `observation_count` sans jamais toucher
+  `confidence`, rendant l'échelle `medium`/`high` inatteignable. La confiance progresse maintenant
+  `low → medium` (dès 2 observations) `→ high` (dès 5), cohérent avec la conception « un insight
+  confirmé cinq fois pèse plus qu'un vu une fois ». La réponse de `POST /items/:id/confirm` expose
+  désormais `confidence`.
+- **`project_id` obligatoire à l'écriture.** `POST /proposals` exige désormais un `project_id` non
+  vide. Auparavant optionnel, il pouvait rester `NULL` et l'item mal taggé fuitait alors vers la
+  vue globale du workspace, entre les clients d'une même agence. La sémantique de lecture reste
+  inchangée (un `NULL` résiduel ne remonte que dans la vue globale) ; c'est l'écriture qui est
+  fermée. Rectifie l'entrée « Isolation `project_id` » du 2026-07-23, qui décrivait le champ comme
+  simplement « quasi toujours renseigné ».
+- **Provenance recalculable durcie.** `metrics` n'exigeait qu'un objet non vide : `{ x: "" }`
+  passait comme provenance valide. Chaque valeur doit désormais être un nombre fini, une chaîne non
+  vide, ou un booléen. Appliqué à `POST /proposals` et à `PATCH /proposals/:id`.
+- **`revertItem`** restaure aussi `last_confirmed_at` et `revalidate_at` depuis le snapshot, pour
+  ne pas laisser un item restauré avec une fraîcheur incohérente vis-à-vis de son contenu.
+
+### Vérifié en conditions réelles
+
+Testé le 2026-07-24 sur AT2O (`J4nir3i7QteyLrvSR1HEy`) après déploiement : `context_confirm` a fait
+passer un item de `low` à `medium` avec `revalidate_at` posé à J+30 ; `context_propose` sans
+`project_id` et avec `metrics` vide sont bien rejetés avant tout débit ; une proposition valide
+reste `pending` sans jamais apparaître dans `context_items`.
+
 ## 2026-07-23
 
 ### Ajouté

@@ -46,7 +46,7 @@ répliqué de `knowledge_history` dans le service Root.
 | `PATCH /proposals/:id` | Édite une proposition encore `pending` |
 | `POST /proposals/:id/accept` | Accepte : écrit dans `items`, journalise l'historique |
 | `POST /proposals/:id/reject` | Refuse, n'écrit jamais dans `items` |
-| `POST /items/:id/confirm` | Incrémente `observation_count`, seule écriture directe agent |
+| `POST /items/:id/confirm` | Incrémente `observation_count`, promeut `confidence` et rafraîchit `revalidate_at` ; seule écriture directe agent |
 | `GET /items/:id/history` | Historique append-only d'un item |
 | `POST /items/:id/revert` | Restaure l'état précédent d'un item |
 | `GET /logs` | Journal d'activité (`project_id?`, `limit?`) |
@@ -58,11 +58,23 @@ tools MCP côté passerelle (`silverbackbase-mcp`).
 
 ## Isolation
 
-Chaque table porte `workspace_id` (obligatoire) et `project_id` (nullable, mais quasi toujours
-renseigné à l'écriture). `project_id` suit une sémantique stricte, pas le défaut inclusif de
-`task_types` : un item sans `project_id` ne remonte que dans une vue globale du workspace, jamais
-sous un `project_id` précis. Un workspace SilverBackBase gère souvent plusieurs clients (une
-agence), `project_id` est la frontière qui les isole les uns des autres.
+Chaque table porte `workspace_id` (obligatoire) et `project_id`. `project_id` est **obligatoire à
+l'écriture** (`POST /proposals` rejette une proposition sans lui) : un item Context naît toujours
+de l'analyse d'un client précis, et le laisser optionnel faisait fuiter un item mal taggé vers la
+vue globale du workspace, entre les clients d'une même agence. La colonne reste `nullable` dans le
+schéma pour les lignes héritées d'avant cette règle. En lecture, `project_id` suit une sémantique
+stricte, pas le défaut inclusif de `task_types` : un item au `project_id` `NULL` (résidu hérité) ne
+remonte que dans la vue globale du workspace, jamais sous un `project_id` précis. Un workspace
+SilverBackBase gère souvent plusieurs clients (une agence), `project_id` est la frontière qui les
+isole les uns des autres.
+
+## Fraîcheur
+
+Chaque item porte `revalidate_at`, posé à 30 jours à la création, à une contradiction acceptée, et
+repoussé à chaque confirmation. `GET /items` calcule un marqueur `stale` (`revalidate_at` dépassé)
+et le renvoie sur chaque item : un item périmé n'est jamais masqué, seulement signalé, pour que
+l'agent le traite avec prudence au lieu de le prendre pour une vérité fraîche. La confiance
+(`confidence`) progresse `low → medium → high` avec le nombre de confirmations.
 
 ## Auth
 
