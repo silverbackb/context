@@ -5,6 +5,14 @@ if (!DATABASE_URL) throw new Error("DATABASE_URL is required : set it in env var
 
 export const sql = postgres(DATABASE_URL, { max: 10 });
 
+// Fenêtre de revalidation par défaut : combien de temps un item reste "frais"
+// après sa création, une contradiction acceptée, ou une confirmation, avant
+// que /items ne le marque `stale` (conception.md §7). 30 jours est une valeur
+// de démarrage arbitraire (aucune donnée historique pour la calibrer à
+// l'ouverture de ce lot) : le service ne fixait jusqu'ici jamais revalidate_at
+// du tout, ce qui rendait le marqueur `stale` inatteignable en pratique.
+const REVALIDATE_WINDOW = sql`NOW() + INTERVAL '30 days'`;
+
 // ── Migration ─────────────────────────────────────────────────────────────────
 //
 // Lot 1 (VIS-248) : schéma réel d'un item Context, une affirmation adossée à
@@ -310,7 +318,7 @@ export async function itemExistsForWorkspace(workspaceId: string, itemId: number
 
 export interface CreateProposalInput {
   workspaceId:        string;
-  projectId?:          string;
+  projectId:          string;
   affirmation:        string;
   primitivesRead:     unknown;
   windowStart?:       string;
@@ -356,6 +364,16 @@ export async function createProposal(input: CreateProposalInput): Promise<Propos
 // correspond (item inexistant, ou n'appartenant pas à ce workspace/projet),
 // pour que la route sache rejeter avec un 404 explicite plutôt que masquer
 // l'échec.
+// Seuils de promotion de `confidence` : un insight confirmé plusieurs fois
+// pèse plus qu'un vu une fois (conception.md §6). Valeurs de démarrage,
+// arbitraires comme REVALIDATE_WINDOW ci-dessus : avant ce correctif,
+// confirmItem incrémentait observation_count sans jamais toucher confidence,
+// ce qui rendait l'échelle medium/high inatteignable quel que soit le nombre
+// de confirmations. `observation_count + 1` (la valeur APRÈS incrément) est
+// évalué dans le même SET que l'incrément lui-même : Postgres évalue toutes
+// les expressions d'un UPDATE sur la ligne AVANT mutation, donc
+// `observation_count + 1` désigne bien la nouvelle valeur ici, pas une
+// relecture après écriture.
 export async function confirmItem(workspaceId: string, itemId: number, projectId?: string): Promise<ItemRow | null> {
   const projectIdFilter = projectId
     ? sql`AND project_id = ${projectId}`
@@ -363,7 +381,13 @@ export async function confirmItem(workspaceId: string, itemId: number, projectId
   const rows = await sql`
     UPDATE items
     SET observation_count = observation_count + 1,
-        last_confirmed_at = NOW()
+        confidence = CASE
+          WHEN observation_count + 1 >= 5 THEN 'high'
+          WHEN observation_count + 1 >= 2 THEN 'medium'
+          ELSE 'low'
+        END,
+        last_confirmed_at = NOW(),
+        revalidate_at = ${REVALIDATE_WINDOW}
     WHERE id = ${itemId}
       AND workspace_id = ${workspaceId}
       ${projectIdFilter}
@@ -501,13 +525,13 @@ export async function acceptProposal(
         INSERT INTO items (
           workspace_id, project_id, affirmation, primitives_read,
           window_start, window_end, metrics, confidence, observation_count,
-          last_confirmed_at, task_types
+          last_confirmed_at, revalidate_at, task_types
         ) VALUES (
           ${workspaceId}, ${proposal.project_id}, ${affirmation},
           ${tx.json(primitivesRead as postgres.JSONValue)},
           ${windowStart}, ${windowEnd},
           ${tx.json(metrics as postgres.JSONValue)},
-          'low', 1, NOW(), ${taskTypes}
+          'low', 1, NOW(), ${REVALIDATE_WINDOW}, ${taskTypes}
         )
         RETURNING *
       `;
@@ -539,6 +563,7 @@ export async function acceptProposal(
           confidence        = 'low',
           observation_count = 1,
           last_confirmed_at = NOW(),
+          revalidate_at     = ${REVALIDATE_WINDOW},
           task_types        = ${taskTypes}
         WHERE id = ${proposal.contradicts_item_id} AND workspace_id = ${workspaceId}
         RETURNING *
@@ -667,6 +692,8 @@ export async function revertItem(
       metrics           = ${sql.json(restored.metrics as postgres.JSONValue)},
       confidence        = ${restored.confidence as string},
       observation_count = ${restored.observation_count as number},
+      last_confirmed_at = ${(restored.last_confirmed_at as string | null) ?? null},
+      revalidate_at     = ${(restored.revalidate_at as string | null) ?? null},
       task_types        = ${(restored.task_types as string[] | null) ?? null}
     WHERE id = ${itemId} AND workspace_id = ${workspaceId}
     RETURNING *

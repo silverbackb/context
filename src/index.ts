@@ -21,6 +21,30 @@ import {
 } from "./db.js";
 import { requireAuth } from "./auth.js";
 
+// Provenance recalculable (conception.md §7) exige des "chiffres qui fondent
+// l'affirmation". Un objet metrics non vide ne suffisait pas à le garantir :
+// { x: "" } passait la validation précédente (objet non vide, sans regarder
+// les valeurs). Une métrique n'est acceptée que si sa valeur est un nombre
+// fini, une chaîne non vide (après trim), ou un booléen : jamais null,
+// undefined, NaN, chaîne vide, objet ou tableau vide. Ça ne rend pas
+// l'hallucination impossible (un chiffre inventé passe toujours ce filtre),
+// mais élimine la provenance purement décorative.
+function isMeaningfulMetricValue(value: unknown): boolean {
+  if (typeof value === "number") return Number.isFinite(value);
+  if (typeof value === "string") return value.trim().length > 0;
+  if (typeof value === "boolean") return true;
+  return false;
+}
+
+function metricsAreValid(metrics: unknown): boolean {
+  if (typeof metrics !== "object" || metrics === null || Array.isArray(metrics)) return false;
+  const entries = Object.entries(metrics as Record<string, unknown>);
+  if (entries.length === 0) return false;
+  return entries.every(([, value]) => isMeaningfulMetricValue(value));
+}
+
+const METRICS_ERROR = "metrics : objet non vide requis, dont chaque valeur doit être un nombre fini, une chaîne non vide ou un booléen (pas de valeur vide/null/NaN) : provenance recalculable, conception.md §7";
+
 let SERVICE_VERSION = "0.0.0";
 try { SERVICE_VERSION = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf-8")).version; } catch {}
 
@@ -107,11 +131,17 @@ app.post("/proposals", requireAuth, async (c) => {
   if (!Array.isArray(primitives_read) || primitives_read.length === 0) {
     return c.json({ error: "primitives_read : tableau non vide requis (provenance recalculable, conception.md §7)" }, 400);
   }
-  if (typeof metrics !== "object" || metrics === null || Array.isArray(metrics) || Object.keys(metrics).length === 0) {
-    return c.json({ error: "metrics : objet non vide requis (provenance recalculable, conception.md §7)" }, 400);
+  if (!metricsAreValid(metrics)) {
+    return c.json({ error: METRICS_ERROR }, 400);
   }
-  if (project_id !== undefined && typeof project_id !== "string") {
-    return c.json({ error: "project_id : chaîne attendue" }, 400);
+  // project_id est la frontière d'isolation entre les clients d'un même
+  // workspace (db.ts, commentaire de listItemsForWorkspace) : un item
+  // project_id=NULL fuit vers la vue "tout le workspace". Un item Context
+  // naît toujours de l'analyse d'un client précis (conception.md §4), donc
+  // obligatoire ici, au seul point d'entrée en écriture d'une affirmation
+  // nouvelle ou d'une contradiction.
+  if (typeof project_id !== "string" || project_id.trim().length === 0) {
+    return c.json({ error: "project_id : chaîne non vide requise (isolation entre clients d'un même workspace)" }, 400);
   }
   if (contradicts_item_id !== undefined && typeof contradicts_item_id !== "number") {
     return c.json({ error: "contradicts_item_id : nombre attendu" }, 400);
@@ -126,7 +156,7 @@ app.post("/proposals", requireAuth, async (c) => {
 
   const proposal = await createProposal({
     workspaceId,
-    projectId: project_id as string | undefined,
+    projectId: project_id,
     affirmation,
     primitivesRead: primitives_read,
     windowStart: window_start as string | undefined,
@@ -186,6 +216,7 @@ app.post("/items/:id/confirm", requireAuth, async (c) => {
     confirmed: true,
     item_id: updated.id,
     observation_count: updated.observation_count,
+    confidence: updated.confidence,
     last_confirmed_at: updated.last_confirmed_at,
   });
 });
@@ -226,8 +257,8 @@ app.patch("/proposals/:id", requireAuth, async (c) => {
   if (primitives_read !== undefined && (!Array.isArray(primitives_read) || primitives_read.length === 0)) {
     return c.json({ error: "primitives_read : tableau non vide requis si fourni (conception.md §7)" }, 400);
   }
-  if (metrics !== undefined && (typeof metrics !== "object" || metrics === null || Array.isArray(metrics) || Object.keys(metrics).length === 0)) {
-    return c.json({ error: "metrics : objet non vide requis si fourni (conception.md §7)" }, 400);
+  if (metrics !== undefined && !metricsAreValid(metrics)) {
+    return c.json({ error: METRICS_ERROR }, 400);
   }
 
   const existing = await getProposal(proposalId, workspaceId);
